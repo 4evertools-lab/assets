@@ -1,0 +1,299 @@
+/**
+ * EASY SIGNATURE - Backend Database & Automation Hub
+ * Connect this Apps Script Web App to your frontend to manage users, data, and integrations.
+ */
+
+// ==========================================
+// CONFIGURATION
+// ==========================================
+// Your main database sheet. If you bound this script to a sheet, you can leave it blank and use SpreadsheetApp.getActiveSpreadsheet().
+const SPREADSHEET_ID = 'ADD_CONTENT_HERE'; 
+
+// Integrations (Leave blank or fill with your keys/urls)
+const CONFIG = {
+  GMAIL_ALIAS: 'no-reply@4evertools.com', // Lazem t3mel setup lda fi settings el Gmail bta3ak
+  ALBATO_WEBHOOK_URL: 'ADD_CONTENT_HERE',
+  WBIZ_CLIENT_ID: 'ADD_CONTENT_HERE',       // (Integer) Mawjoud fi safhat API Keys
+  WBIZ_API_KEY: 'ADD_CONTENT_HERE',           // (String) Mawjoud fi safhat API Keys
+  WBIZ_WHATSAPP_CLIENT: 'ADD_CONTENT_HERE',   // (Integer) Mawjoud fi safhat Whatsapp Setting
+  WBIZ_ENDPOINT: 'https://wbiztool.com/api/v1/send_msg/', // Endpoint 3ashan taba3at messages
+  PAYPAL_API_URL: 'https://api-m.paypal.com',
+  ZYLVIE_WEBHOOK_SECRET: 'ADD_CONTENT_HERE',
+  
+  // E3dadat MailerLite Classic (API v2)
+  MAILERLITE_API_KEY: 'ADD_CONTENT_HERE',
+  MAILERLITE_GROUP_ID: 'ADD_CONTENT_HERE' // The specific group to add users to for the automation funnel
+};
+
+
+
+
+
+// ==========================================
+// ROUTER & ENTRY POINT
+// ==========================================
+
+function doPost(e) {
+  try {
+    const request = JSON.parse(e.postData.contents);
+    const action = request.action;
+    const payload = request.payload;
+    let response = {};
+
+    switch (action) {
+      case 'register':
+        response = handleRegister(payload);
+        break;
+      case 'login':
+        response = handleLogin(payload);
+        break;
+      case 'saveSignature':
+        response = handleSaveSignature(payload);
+        break;
+      default:
+        response = { success: false, error: 'Unknown action' };
+    }
+
+    return ContentService.createTextOutput(JSON.stringify(response))
+      .setMimeType(ContentService.MimeType.JSON);
+
+  } catch (error) {
+    return ContentService.createTextOutput(JSON.stringify({ success: false, error: error.toString() }))
+      .setMimeType(ContentService.MimeType.JSON);
+  }
+}
+
+// Ensure the necessary sheets exist
+function getDbSheet(sheetName) {
+  let ss = SPREADSHEET_ID ? SpreadsheetApp.openById(SPREADSHEET_ID) : SpreadsheetApp.getActiveSpreadsheet();
+  let sheet = ss.getSheetByName(sheetName);
+  
+  if (!sheet) {
+    sheet = ss.insertSheet(sheetName);
+    if (sheetName === 'Users') {
+      // Define Columns: ID, Timestamp, Name, Email, Password, WhatsApp, Source, Language, Status, Plan
+      sheet.appendRow(['ID', 'Timestamp', 'Name', 'Email', 'Password', 'WhatsApp', 'Source', 'Language', 'Status', 'Plan']);
+      sheet.getRange("A1:J1").setFontWeight("bold").setBackground("#e0e0e0");
+    } else if (sheetName === 'Signatures') {
+      sheet.appendRow(['ID', 'Timestamp', 'UserEmail', 'SignatureData']);
+      sheet.getRange("A1:D1").setFontWeight("bold").setBackground("#e0e0e0");
+    }
+  }
+  return sheet;
+}
+
+
+// ==========================================
+// CORE MODULES: AUTH & DATABASE
+// ==========================================
+
+function handleRegister(payload) {
+  const sheet = getDbSheet('Users');
+  const data = sheet.getDataRange().getValues();
+  
+  // Check if email already exists
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][3].toLowerCase() === payload.email.toLowerCase()) {
+      return { success: false, error: 'Email already registered.' };
+    }
+  }
+
+  const userId = Utilities.getUuid();
+  const timestamp = new Date();
+  
+  // Default assignments manually requested
+  const status = 'Pending'; // Pending, Active, Terminated, Canceled
+  const plan = 'Personal'; // Personal, Start-up, Business, Agency
+
+  // Store user in sheet (Caution: Passwords should be hashed in production. Showing plain/base64 for GAS simplicity)
+  sheet.appendRow([
+    userId, 
+    timestamp, 
+    payload.name, 
+    payload.email, 
+    Utilities.base64Encode(payload.password), // Basic obfuscation
+    payload.whatsapp, 
+    payload.source, 
+    payload.language, // Added Language to the database row
+    status, 
+    plan
+  ]);
+
+  // Trigger automation: Welcome email via Alias
+  triggerEmailAutomation(payload.email, payload.name, "Welcome to Easy Signature!");
+
+  // Trigger automation: Albato & WBiz
+  triggerAlbato({ event: 'new_user', user: payload });
+  triggerWBiz(payload.whatsapp, `Hi ${payload.name}, welcome to Easy Signature!`);
+  
+  // Trigger automation: MailerLite Classic
+  triggerMailerLite(payload);
+
+  return { success: true, message: 'User registered successfully' };
+}
+
+function handleLogin(payload) {
+  const sheet = getDbSheet('Users');
+  const data = sheet.getDataRange().getValues();
+  const encodedAttempt = Utilities.base64Encode(payload.password);
+  
+  for (let i = 1; i < data.length; i++) {
+    if (data[i][3].toLowerCase() === payload.email.toLowerCase()) {
+      if (data[i][4] === encodedAttempt) {
+        
+        // Block access if terminated or canceled
+        if (data[i][8] === 'Terminated' || data[i][8] === 'Canceled') { // adjusted index for status column
+          return { success: false, error: 'Account is no longer active. Contact support.' };
+        }
+
+        return { 
+          success: true, 
+          user: {
+            id: data[i][0],
+            name: data[i][2],
+            email: data[i][3],
+            status: data[i][8],
+            plan: data[i][9]
+          } 
+        };
+      } else {
+        return { success: false, error: 'Incorrect password.' };
+      }
+    }
+  }
+  return { success: false, error: 'User not found.' };
+}
+
+function handleSaveSignature(payload) {
+  // Enforce Plan Limits logic
+  const limitDict = { 'Personal': 1, 'Start-up': 5, 'Business': 50, 'Agency': 999999 };
+  const userPlan = payload.user.plan;
+  const maxLimit = limitDict[userPlan] || 1;
+
+  const sheet = getDbSheet('Signatures');
+  const allSigs = sheet.getDataRange().getValues();
+  let userSigCount = 0;
+
+  for (let i = 1; i < allSigs.length; i++) {
+    if (allSigs[i][2] === payload.user.email) userSigCount++;
+  }
+
+  if (userSigCount >= maxLimit) {
+    return { 
+      success: false, 
+      error: `Plan limit reached (${maxLimit}). Please upgrade your plan.`,
+      errorCode: 'LIMIT_REACHED' 
+    };
+  }
+
+  sheet.appendRow([Utilities.getUuid(), new Date(), payload.user.email, JSON.stringify(payload.signatureData)]);
+  return { success: true, message: 'Signature saved' };
+}
+
+
+// ==========================================
+// INTEGRATIONS MODULE (Modular Webhooks)
+// ==========================================
+
+function triggerMailerLite(userPayload) {
+  if (!CONFIG.MAILERLITE_API_KEY || !CONFIG.MAILERLITE_GROUP_ID) return;
+
+  const url = `https://api.mailerlite.com/api/v2/groups/${CONFIG.MAILERLITE_GROUP_ID}/subscribers`;
+
+  // Map custom fields to MailerLite payload
+  const payload = {
+    email: userPayload.email,
+    name: userPayload.name,
+    fields: {
+      whatsapp: userPayload.whatsapp,
+      source: userPayload.source,
+      language: userPayload.language
+    },
+    resubscribe: true, // Allows them to be re-added if they were previously unsubscribed
+    autoresponders: true // Ensures your funnel automation starts immediately
+  };
+
+  const options = {
+    method: 'post',
+    headers: {
+      'X-MailerLite-ApiKey': CONFIG.MAILERLITE_API_KEY,
+      'Content-Type': 'application/json'
+    },
+    payload: JSON.stringify(payload),
+    muteHttpExceptions: true // Prevents the whole script from crashing if MailerLite returns an error
+  };
+
+  try {
+    const response = UrlFetchApp.fetch(url, options);
+    Logger.log("MailerLite Response: " + response.getContentText());
+  } catch (e) {
+    Logger.log("MailerLite API Failed: " + e);
+  }
+}
+
+function triggerEmailAutomation(toEmail, name, subject) {
+  try {
+    const htmlBody = `
+      <h3>Hello ${name}!</h3>
+      <p>Thank you for registering to Easy Signature.</p>
+      <p>Your account status is currently <b>Pending</b>. Feel free to start creating your signature.</p>
+    `;
+    
+    // Sends email using the alias requested
+    GmailApp.sendEmail(toEmail, subject, "", {
+      htmlBody: htmlBody,
+      from: CONFIG.GMAIL_ALIAS,
+      name: "Easy Signature Team"
+    });
+  } catch (e) {
+    Logger.log("Failed to send email. Ensure the alias is configured: " + e);
+  }
+}
+
+function triggerAlbato(dataPayload) {
+  if (!CONFIG.ALBATO_WEBHOOK_URL) return;
+  try {
+    UrlFetchApp.fetch(CONFIG.ALBATO_WEBHOOK_URL, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(dataPayload),
+      muteHttpExceptions: true
+    });
+  } catch (e) {
+    Logger.log("Albato Trigger Failed: " + e);
+  }
+}
+
+function triggerWBiz(phoneNumber, messageText) {
+  if (!CONFIG.WBIZ_API_KEY || !CONFIG.WBIZ_CLIENT_ID || !CONFIG.WBIZ_WHATSAPP_CLIENT) return;
+  
+  try {
+    // WBizTool requires auth credentials in the body of every request
+    const payload = {
+      client_id: parseInt(CONFIG.WBIZ_CLIENT_ID, 10),
+      api_key: CONFIG.WBIZ_API_KEY,
+      whatsapp_client: parseInt(CONFIG.WBIZ_WHATSAPP_CLIENT, 10),
+      phone: phoneNumber,
+      msg: messageText
+    };
+    
+    UrlFetchApp.fetch(CONFIG.WBIZ_ENDPOINT, {
+      method: 'post',
+      contentType: 'application/json',
+      payload: JSON.stringify(payload),
+      muteHttpExceptions: true
+    });
+  } catch(e) {
+    Logger.log("WBiz API Failed: " + e);
+  }
+}
+
+// Module placeholder for PayPal webhook handling
+function handlePayPalWebhook(e) {
+  // Logic to parse PayPal IPN / Webhooks to update Plan column automatically
+}
+
+// Module placeholder for Zylvie checkout integration
+function handleZylvieWebhook(e) {
+  // Logic to parse Zylvie successful checkout events
+}
